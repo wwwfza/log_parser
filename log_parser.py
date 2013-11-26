@@ -1,16 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env:: python
 # -*- coding: utf-8 -*-
 """
-log_parser_register.py
-parse logs and update to db
+log_parser.py
+parse access_register_logs & access_tag_logs ad update table "app_dimension" in db "message" 
     
 author fanzhengang@umeng.com 2013-10-11
 ---------------------------------------
-1.revised 2013-11-07
-decode the log by string_escape before match
-and encode the record from db into utf8
-all the string use utf8
-
 """
 import pdb,traceback
 import time,sys,os
@@ -18,104 +13,86 @@ import re
 import ConfigParser 
 import MySQLdb
 
-def getExcInfo():
+col_names = ["tag","app_version","channel","time_zone"]
+
+def get_exc_info():
     type,value,tb = sys.exc_info()
     return str(traceback.format_exception(type,value,tb))
 
-log_path = ""		
-def log(info,level = 'trace'):
-    fd = open(log_path,"a")
-    mes = "[%s][%s][%s]\n" % (time.asctime(),level,info)  
-    fd.write(mes)
-    fd.close()
-
-def log_parse(pattens,string):
-    result = {}
+#get needed information
+#log line => info {'appkey': '5228291356240bec3b098acc', 'versions': '1.2.1', 'channels': 'xxx'}
+def parse_log_line(pattens,string):
+    info = {}
     for pattern in patterns:
         match = patterns[pattern].search(string)        
         if match:
-            result[pattern] = match.group(1)
-    return result
+            info[pattern] = match.group(1)
+    return info
 
-def result_parse(info,result):
+#format information according to conf file [re] names and sequence
+#info => result {'5228291356240bec3b098acc': {'tags': '', 'versions': '1.2.1', 'channels': 'xxx'}}
+def merge_log_line(info,col_names,result):
     key = info.get("appkey")
     if key is None:
         return
-    tag = info.get("tag","")
-    version = info.get("app_version","")
-    channel = info.get("channel","")
-    col_names = ["tag","version","channel"]   
  
     if result.has_key(key):
-        cols = result[key]
         for name in col_names:
-            value_list = cols[name].split(",")
-            value_list = list(set(value_list).union(set(eval(name).split(","))))
-            value_list = [ i for i in value_list if i != '']
-            cols[name] = ",".join(sorted(value_list))
-       # tags = cols["tag"].split(",")
-       # if tag not in tags:
-       #     tags = [i for i in tags if i != ""]
-       #     tags.append(tag)
-       #     cols["tag"] = ",".join(sorted(tags))
-
+            old_values = result[key][name].split(",")
+            new_values = info.get(name,"").split(",")
+            final_values = list(set(old_values).union(set(new_values)))
+            final_values = [ i for i in final_values if i != '']
+            result[key][name] = ",".join(sorted(final_values))
     else:
         cols = {} 
         for name in col_names:
-            cols[name] = eval(name)
-       # cols['tag'] = tag
-       # cols["version"] = version
-       # cols["channel"] = channel
+            cols[name] = info.get(name,"") 
         result[key] = cols
 
-def update_db(db,result):
+def update_db(db,col_names,result):
     try:
         conn = MySQLdb.connect(host=db["host"],user=db["user"],passwd=db["passwd"],db=db["db"],charset='utf8')
         cursor = conn.cursor()
 
         for key in result:
             cols = result[key]
-            r = cursor.execute("select * from %s where appkey = '%s'" % (db["table"],key))
+            select_cols = ",".join(col_names)
+            r = cursor.execute("select %s from %s where appkey = '%s'" % (select_cols,db["table"],key))
             if r == 0:
                 #new row
-                cursor.execute("insert into %s values('%s','%s','%s','%s')" % (db["table"],key,cols["tag"],cols["version"],cols["channel"]))
-                log("insert %s{appkey:'%s',tags:'%s',versions:'%s',channels:'%s'})" % (db["table"],key,cols["tag"],cols["version"],cols["channel"]))
+                value = "'%s',%s" % (key,",".join(["'%s'"%cols[i] for i in col_names]))
+                cmd = "insert into %s values(%s)" % (db["table"],value)
+                cursor.execute(cmd)
+                print cmd
             elif r == 1:
                 #update row
                 db_row = cursor.fetchone()
+                value_ls = [] 
+                for i in range(0,len(col_names)):
+                #i+1 means ig
+                    old_value = db_row[i].encode("utf8").split(",")
+                    new_value = list(set(old_value).union(set(cols[col_names[i]].split(","))))
+                    final_value = ",".join([ v for v in new_value if v != '']) 
+                    if final_value != '':           
+                        value_ls.append("%s='%s'"%(col_names[i],final_value))
                 
-                old_tags = db_row[1].encode("utf8").split(",")
-                new_tags = list(set(old_tags).union(set(cols["tag"].split(","))))
-                tag = ",".join([ i for i in new_tags if i != ''])            
-                old_versions = db_row[2].encode("utf8").split(",")
-                new_versions = list(set(old_versions).union(set(cols["version"].split(","))))
-                version = ",".join([ i for i in new_versions if i != ''])
-                old_channels = db_row[3].encode("utf8").split(",")
-                new_channels = list(set(old_channels).union(set(cols["channel"].split(","))))
-                channel = ",".join([ i for i in new_channels if i != '']) 
-                
-                cursor.execute("update %s set tags='%s',versions='%s',channels='%s' where appkey= '%s'" % (db["table"],tag,version,channel,key))
-                log("update %s{appkey:'%s',tags:'%s',versions:'%s',channels:'%s'}" % (db["table"],key,tag,version,channel))
-       
+                cmd = "update %s set %s where appkey='%s'" % (db["table"],",".join(value_ls),key)
+                cursor.execute(cmd)
+                print cmd 
         conn.commit()
         cursor.close()
         conn.close()
     except MySQLdb.Error,e:
-        log("Mysql Error %d: %s" % (e.args[0], e.args[1]))
+        print "Mysql Error %d: %s" % (e.args[0], e.args[1])
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        mes = "error, missing log path parameter!"
-        log(mes)
-        print mes    
+        print "error, must specified target log file!"
         sys.exit(-1)
     log_file = sys.argv[1]
     conf_path = sys.argv[0][:].replace("log_parser.py","log_parser.conf")
-    log_path = sys.argv[0][:].replace("log_parser.py","log_parser.log")
     if not os.path.exists(conf_path):
-        mes = "error, missing regular configuration files!"
-        log(mes)
-        print mes
+        print "error, need configuration file!"
         sys.exit(-1);
     cf = ConfigParser.ConfigParser()
     cf.read(conf_path)
@@ -123,26 +100,29 @@ if __name__ == "__main__":
     for name,value in cf.items("db"):
         db[name] = value
     patterns = {}
+    col_names = []
     for name,value in cf.items("re"):
         patterns[name] = re.compile(value)
+        if(name != 'appkey'):
+            col_names.append(name)
 
     try:
         reload(sys)
         sys.setdefaultencoding('utf-8')
         start_time = time.clock()
-        log("start parsing log %s"%(log_file))
+        print "start parsing log %s"%(log_file)
         result = {}        
         fd = open(log_file,"r")
         try:
             for line in fd.readlines():
-                info = log_parse(patterns,line.decode('string_escape'))
-                result_parse(info,result)
-            #pdb.set_trace()
-            update_db(db,result)
+                info = parse_log_line(patterns,line.decode('string_escape'))
+                merge_log_line(info,col_names,result)
+            pdb.set_trace()
+            update_db(db,col_names,result)
         finally:
             fd.close()
-        log("end parsing, time: %fs" % (time.clock()-start_time))        
+        print "end parsing, time: %fs\n" % (time.clock()-start_time)       
     except:
-        log(getExcInfo())
+        print get_exc_info()
 
  
